@@ -36,6 +36,7 @@ type Config struct {
 const (
 	kindGitHub  = "github"
 	kindGeneric = "generic"
+	kindAlert   = "alert"
 
 	verifyHMAC  = "hmac"
 	verifyToken = "token"
@@ -426,10 +427,17 @@ func resolveRoute(spec routeSpec) (Route, error) {
 		}
 		return route, nil
 	}
+	if kind == kindAlert && len(fields) > 0 {
+		return Route{}, fmt.Errorf("route %s: kind alert does not use fields", name)
+	}
 
 	verify := strings.ToLower(strings.TrimSpace(spec.Verify))
 	if verify == "" {
-		verify = verifyHMAC
+		if kind == kindAlert {
+			verify = verifyToken
+		} else {
+			verify = verifyHMAC
+		}
 	}
 	if verify != verifyHMAC && verify != verifyToken {
 		return Route{}, fmt.Errorf("route %s: unknown verify %q", name, spec.Verify)
@@ -450,7 +458,7 @@ func resolveRoute(spec routeSpec) (Route, error) {
 		prefix = "Bearer "
 	}
 	title := strings.TrimSpace(spec.Title)
-	if title == "" {
+	if kind == kindGeneric && title == "" {
 		title = name
 	}
 	route.Verify = verify
@@ -465,10 +473,14 @@ func routeKind(spec routeSpec) (string, error) {
 	if kind == "" {
 		return kindGitHub, nil
 	}
-	if kind != kindGitHub && kind != kindGeneric {
+	switch kind {
+	case kindGitHub, kindGeneric:
+		return kind, nil
+	case kindAlert, "alertmanager", "grafana":
+		return kindAlert, nil
+	default:
 		return "", fmt.Errorf("unknown kind %q", spec.Kind)
 	}
-	return kind, nil
 }
 
 func cleanFields(fields []string) ([]string, error) {
@@ -1270,6 +1282,285 @@ func formatJSON(v any) string {
 	}
 }
 
+type alertPayload struct {
+	Status            string            `json:"status"`
+	State             string            `json:"state"`
+	Title             string            `json:"title"`
+	Message           string            `json:"message"`
+	ExternalURL       string            `json:"externalURL"`
+	TruncatedAlerts   int               `json:"truncatedAlerts"`
+	GroupLabels       map[string]string `json:"groupLabels"`
+	CommonLabels      map[string]string `json:"commonLabels"`
+	CommonAnnotations map[string]string `json:"commonAnnotations"`
+	Alerts            []alertItem       `json:"alerts"`
+	RuleName          string            `json:"ruleName"`
+	RuleURL           string            `json:"ruleUrl"`
+	EvalMatches       []grafanaMatch    `json:"evalMatches"`
+}
+
+type alertItem struct {
+	Status       string            `json:"status"`
+	Labels       map[string]string `json:"labels"`
+	Annotations  map[string]string `json:"annotations"`
+	GeneratorURL string            `json:"generatorURL"`
+	DashboardURL string            `json:"dashboardURL"`
+	PanelURL     string            `json:"panelURL"`
+	ValueString  string            `json:"valueString"`
+	Fingerprint  string            `json:"fingerprint"`
+}
+
+type grafanaMatch struct {
+	Value  any    `json:"value"`
+	Metric string `json:"metric"`
+}
+
+func buildAlertMessage(route Route, body []byte) (signalText, error) {
+	var p alertPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		return signalText{}, err
+	}
+	if len(p.Alerts) == 0 && len(p.EvalMatches) == 0 && p.RuleName == "" && p.Status == "" && p.State == "" && p.Title == "" {
+		return signalText{}, fmt.Errorf("unrecognized alert payload")
+	}
+
+	status := alertStatus(p)
+	emoji, title := alertPresentation(status)
+	name := alertName(p)
+	if name == "" {
+		name = route.Title
+	}
+	summary := alertSummary(p)
+	resolved := canonAlertStatus(status) == "resolved"
+
+	var w textBuilder
+	w.header(emoji, title, name)
+	if severity := labelValue(p.CommonLabels, p.Alerts, "severity"); severity != "" {
+		w.field("Severity", severity)
+	}
+	total := len(p.Alerts) + p.TruncatedAlerts
+	if total > 1 {
+		w.field("Alerts", strconv.Itoa(total))
+	}
+	if summary != "" {
+		w.prose(truncate(summary, 200), resolved)
+		w.nl()
+	}
+
+	shown := 0
+	for _, item := range p.Alerts {
+		if shown == maxShownAlerts {
+			break
+		}
+		if shown == 0 {
+			w.nl()
+		}
+		shown++
+		writeAlertBullet(&w, status, name, summary, item)
+	}
+	if shown == 0 {
+		for _, match := range p.EvalMatches {
+			if shown == maxShownAlerts {
+				break
+			}
+			if shown == 0 {
+				w.nl()
+			}
+			shown++
+			w.write("• ")
+			if match.Metric != "" {
+				w.mono(match.Metric)
+				w.write(" ")
+			}
+			w.write(formatJSON(match.Value))
+			w.nl()
+		}
+	}
+	extra := len(p.Alerts) - shown + p.TruncatedAlerts
+	if extra < 0 {
+		extra = len(p.EvalMatches) - shown
+	}
+	if extra > 0 {
+		w.italic(fmt.Sprintf("… and %d more", extra))
+		w.nl()
+	}
+	w.link(alertLink(p))
+	return w.done(), nil
+}
+
+const maxShownAlerts = 5
+
+var alertLabelKeys = []string{
+	"instance", "pod", "container", "job", "namespace", "service",
+	"node", "device", "mountpoint", "endpoint", "persistentvolumeclaim",
+}
+
+func alertStatus(p alertPayload) string {
+	if s := strings.TrimSpace(p.Status); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(p.State); s != "" {
+		return s
+	}
+	if len(p.Alerts) > 0 {
+		return p.Alerts[0].Status
+	}
+	return ""
+}
+
+func canonAlertStatus(status string) string {
+	switch strings.ToLower(status) {
+	case "firing", "alerting":
+		return "firing"
+	case "resolved", "ok":
+		return "resolved"
+	default:
+		return strings.ToLower(status)
+	}
+}
+
+func alertPresentation(status string) (string, string) {
+	switch canonAlertStatus(status) {
+	case "firing":
+		return "🔥", "Firing"
+	case "resolved":
+		return "✅", "Resolved"
+	case "pending":
+		return "⏳", "Pending"
+	case "no_data":
+		return "❓", "No data"
+	case "paused":
+		return "⏸️", "Paused"
+	default:
+		if status == "" {
+			return "🔔", "Alert"
+		}
+		return "🔔", prettyAction(status)
+	}
+}
+
+func alertName(p alertPayload) string {
+	if name := labelValue(p.CommonLabels, nil, "alertname"); name != "" {
+		return name
+	}
+	if name := p.GroupLabels["alertname"]; name != "" {
+		return name
+	}
+	if len(p.Alerts) > 0 {
+		if name := p.Alerts[0].Labels["alertname"]; name != "" {
+			return name
+		}
+	}
+	if p.RuleName != "" {
+		return p.RuleName
+	}
+	if p.Title != "" && !strings.HasPrefix(strings.TrimSpace(p.Title), "[") {
+		return p.Title
+	}
+	return ""
+}
+
+func alertSummary(p alertPayload) string {
+	if text := annotationText(p.CommonAnnotations); text != "" {
+		return text
+	}
+	if len(p.Alerts) > 0 {
+		if text := annotationText(p.Alerts[0].Annotations); text != "" {
+			return text
+		}
+	}
+	return firstLine(p.Message)
+}
+
+func annotationText(m map[string]string) string {
+	if text := firstLine(m["summary"]); text != "" {
+		return text
+	}
+	return firstLine(m["description"])
+}
+
+func labelValue(common map[string]string, alerts []alertItem, key string) string {
+	if v := common[key]; v != "" {
+		return v
+	}
+	if len(alerts) > 0 {
+		return alerts[0].Labels[key]
+	}
+	return ""
+}
+
+func writeAlertBullet(w *textBuilder, groupStatus, groupName, groupSummary string, item alertItem) {
+	w.write("• ")
+	if itemStatus := strings.TrimSpace(item.Status); itemStatus != "" && canonAlertStatus(itemStatus) != canonAlertStatus(groupStatus) {
+		w.write(itemStatus)
+		w.write(" ")
+	}
+	target := alertTarget(item.Labels, groupName)
+	if target == "" && item.Fingerprint != "" {
+		target = shortSHA(item.Fingerprint)
+	}
+	if target != "" {
+		w.mono(target)
+	}
+	detail := annotationText(item.Annotations)
+	if detail == groupSummary {
+		detail = ""
+	}
+	if detail == "" {
+		detail = firstLine(item.ValueString)
+	}
+	if detail != "" {
+		if target != "" {
+			w.nl()
+			w.write("  ")
+		} else {
+			w.write(" ")
+		}
+		w.italic(truncate(detail, 150))
+	}
+	w.nl()
+}
+
+func alertTarget(labels map[string]string, groupName string) string {
+	var parts []string
+	for _, key := range alertLabelKeys {
+		if v := labels[key]; v != "" {
+			parts = append(parts, v)
+			if len(parts) == 2 {
+				break
+			}
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, " ")
+	}
+	if name := labels["alertname"]; name != "" && name != groupName {
+		return name
+	}
+	return ""
+}
+
+func alertLink(p alertPayload) string {
+	for _, item := range p.Alerts {
+		if item.PanelURL != "" {
+			return item.PanelURL
+		}
+	}
+	for _, item := range p.Alerts {
+		if item.DashboardURL != "" {
+			return item.DashboardURL
+		}
+	}
+	for _, item := range p.Alerts {
+		if item.GeneratorURL != "" {
+			return item.GeneratorURL
+		}
+	}
+	if p.RuleURL != "" {
+		return p.RuleURL
+	}
+	return p.ExternalURL
+}
+
 func webhook(api string, route Route) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1293,12 +1584,16 @@ func webhook(api string, route Route) http.HandlerFunc {
 			notify  bool
 			event   string
 		)
-		if route.Kind == kindGeneric {
+		if route.Kind == kindGeneric || route.Kind == kindAlert {
 			if !verifyGeneric(route, r.Header.Get(route.Header), body) {
 				http.Error(w, "Invalid signature", http.StatusUnauthorized)
 				return
 			}
-			message, err = buildGenericMessage(route, body)
+			if route.Kind == kindAlert {
+				message, err = buildAlertMessage(route, body)
+			} else {
+				message, err = buildGenericMessage(route, body)
+			}
 			notify = true
 			event = route.Name
 		} else {
