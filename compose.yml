@@ -5,13 +5,13 @@ services:
     restart: unless-stopped
     command: tunnel run
     environment:
-      - TUNNEL_URL=http://github-webhook:8080
+      - TUNNEL_URL=http://webhook-signal:8080
       - TUNNEL_TOKEN=${TUNNEL_TOKEN:?}
     networks:
       - cloudflared
 
-  github-webhook:
-    image: ghcr.io/kalex3/github-webhook-signal:latest
+  webhook-signal:
+    image: ghcr.io/kalex3/webhook-signal:latest
     restart: unless-stopped
     # Several endpoints: copy routes.example.json to routes.json, uncomment
     # the volume and ROUTES_FILE, and pass each secretEnv in environment.

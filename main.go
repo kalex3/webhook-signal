@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -32,12 +33,26 @@ type Config struct {
 	Routes    []Route
 }
 
-// Route is one GitHub webhook endpoint and the Signal chats it notifies.
+const (
+	kindGitHub  = "github"
+	kindGeneric = "generic"
+
+	verifyHMAC  = "hmac"
+	verifyToken = "token"
+)
+
+// Route is one webhook endpoint and the Signal chats it notifies.
 type Route struct {
 	Name       string
+	Kind       string
 	Path       string
 	Secret     string
 	Recipients []string
+	Verify     string
+	Header     string
+	Prefix     string
+	Title      string
+	Fields     []string
 }
 
 type routeFile struct {
@@ -46,11 +61,17 @@ type routeFile struct {
 
 type routeSpec struct {
 	Name          string   `json:"name"`
+	Kind          string   `json:"kind"`
 	Path          string   `json:"path"`
 	Secret        string   `json:"secret"`
 	SecretEnv     string   `json:"secretEnv"`
 	Recipients    []string `json:"recipients"`
 	RecipientsEnv string   `json:"recipientsEnv"`
+	Verify        string   `json:"verify"`
+	Header        string   `json:"header"`
+	Prefix        string   `json:"prefix"`
+	Title         string   `json:"title"`
+	Fields        []string `json:"fields"`
 }
 
 type deliveryFailure struct {
@@ -294,6 +315,7 @@ func legacyRoute() ([]Route, error) {
 	}
 	route := Route{
 		Name:       "github",
+		Kind:       kindGitHub,
 		Path:       normalizePath(env("WEBHOOK_PATH", "/webhook")),
 		Secret:     secret,
 		Recipients: recipients,
@@ -381,12 +403,87 @@ func resolveRoute(spec routeSpec) (Route, error) {
 		return Route{}, fmt.Errorf("route %s: missing recipients", name)
 	}
 
-	return Route{
+	kind, err := routeKind(spec)
+	if err != nil {
+		return Route{}, fmt.Errorf("route %s: %w", name, err)
+	}
+	fields, err := cleanFields(spec.Fields)
+	if err != nil {
+		return Route{}, fmt.Errorf("route %s: %w", name, err)
+	}
+
+	route := Route{
 		Name:       name,
+		Kind:       kind,
 		Path:       webhookPath,
 		Secret:     secret,
 		Recipients: recipients,
-	}, nil
+		Fields:     fields,
+	}
+	if kind == kindGitHub {
+		if spec.Verify != "" || spec.Header != "" || spec.Prefix != "" || spec.Title != "" || len(fields) > 0 {
+			return Route{}, fmt.Errorf("route %s: kind github does not use verify, header, prefix, title, or fields", name)
+		}
+		return route, nil
+	}
+
+	verify := strings.ToLower(strings.TrimSpace(spec.Verify))
+	if verify == "" {
+		verify = verifyHMAC
+	}
+	if verify != verifyHMAC && verify != verifyToken {
+		return Route{}, fmt.Errorf("route %s: unknown verify %q", name, spec.Verify)
+	}
+	header := strings.TrimSpace(spec.Header)
+	if header == "" {
+		if verify == verifyToken {
+			header = "Authorization"
+		} else {
+			header = "X-Signature-256"
+		}
+	}
+	if strings.ContainsAny(header, "\r\n:") {
+		return Route{}, fmt.Errorf("route %s: invalid header %q", name, header)
+	}
+	prefix := spec.Prefix
+	if prefix == "" && strings.EqualFold(header, "Authorization") && verify == verifyToken {
+		prefix = "Bearer "
+	}
+	title := strings.TrimSpace(spec.Title)
+	if title == "" {
+		title = name
+	}
+	route.Verify = verify
+	route.Header = header
+	route.Prefix = prefix
+	route.Title = title
+	return route, nil
+}
+
+func routeKind(spec routeSpec) (string, error) {
+	kind := strings.ToLower(strings.TrimSpace(spec.Kind))
+	if kind == "" {
+		return kindGitHub, nil
+	}
+	if kind != kindGitHub && kind != kindGeneric {
+		return "", fmt.Errorf("unknown kind %q", spec.Kind)
+	}
+	return kind, nil
+}
+
+func cleanFields(fields []string) ([]string, error) {
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" || strings.Contains(field, "..") || strings.HasPrefix(field, ".") || strings.HasSuffix(field, ".") || strings.ContainsAny(field, " \t") {
+			return nil, fmt.Errorf("invalid field %q", field)
+		}
+		out = append(out, field)
+	}
+	return out, nil
 }
 
 func verifySignature(secret string, body []byte, signature string) bool {
@@ -1075,6 +1172,104 @@ func deliver(api string, recipients []string, message signalText) (int, []delive
 	return sent, failures
 }
 
+func verifyGeneric(route Route, headerValue string, body []byte) bool {
+	switch route.Verify {
+	case verifyHMAC:
+		return verifySignature(route.Secret, body, headerValue)
+	case verifyToken:
+		got := headerValue
+		if route.Prefix != "" {
+			rest, ok := strings.CutPrefix(headerValue, route.Prefix)
+			if !ok {
+				return false
+			}
+			got = rest
+		}
+		return hmac.Equal([]byte(got), []byte(route.Secret))
+	default:
+		return false
+	}
+}
+
+func buildGenericMessage(route Route, body []byte) (signalText, error) {
+	var w textBuilder
+	w.header("🔔", route.Title, "")
+	if len(route.Fields) == 0 {
+		if text := genericBody(body); text != "" {
+			w.nl()
+			w.write(truncate(text, 400))
+		}
+		return w.done(), nil
+	}
+
+	var doc any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return signalText{}, err
+	}
+	var linkURL string
+	for _, field := range route.Fields {
+		shown := "unknown"
+		if value, ok := lookupJSON(doc, field); ok {
+			shown = truncate(value, 200)
+		}
+		w.field(field, shown)
+		if linkURL == "" && (strings.HasPrefix(shown, "https://") || strings.HasPrefix(shown, "http://")) {
+			linkURL = shown
+		}
+	}
+	if linkURL != "" {
+		w.link(linkURL)
+	}
+	return w.done(), nil
+}
+
+func genericBody(body []byte) string {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return ""
+	}
+	var compacted bytes.Buffer
+	if json.Compact(&compacted, body) == nil {
+		return compacted.String()
+	}
+	return string(body)
+}
+
+func lookupJSON(v any, path string) (string, bool) {
+	cur := v
+	for _, part := range strings.Split(path, ".") {
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		cur, ok = obj[part]
+		if !ok || cur == nil {
+			return "", false
+		}
+	}
+	return formatJSON(cur), true
+}
+
+func formatJSON(v any) string {
+	switch n := v.(type) {
+	case string:
+		return n
+	case float64:
+		if !math.IsInf(n, 0) && n >= math.MinInt64 && n <= math.MaxInt64 && n == math.Trunc(n) {
+			return strconv.FormatInt(int64(n), 10)
+		}
+		return strconv.FormatFloat(n, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(n)
+	default:
+		encoded, err := json.Marshal(n)
+		if err != nil {
+			return ""
+		}
+		return string(encoded)
+	}
+}
+
 func webhook(api string, route Route) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1082,7 +1277,7 @@ func webhook(api string, route Route) http.HandlerFunc {
 			return
 		}
 
-		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		if route.Kind != kindGeneric && !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 			http.Error(w, "Expected application/json", http.StatusUnsupportedMediaType)
 			return
 		}
@@ -1093,13 +1288,27 @@ func webhook(api string, route Route) http.HandlerFunc {
 			return
 		}
 
-		if !verifySignature(route.Secret, body, r.Header.Get("X-Hub-Signature-256")) {
-			http.Error(w, "Invalid signature", http.StatusUnauthorized)
-			return
+		var (
+			message signalText
+			notify  bool
+			event   string
+		)
+		if route.Kind == kindGeneric {
+			if !verifyGeneric(route, r.Header.Get(route.Header), body) {
+				http.Error(w, "Invalid signature", http.StatusUnauthorized)
+				return
+			}
+			message, err = buildGenericMessage(route, body)
+			notify = true
+			event = route.Name
+		} else {
+			if !verifySignature(route.Secret, body, r.Header.Get("X-Hub-Signature-256")) {
+				http.Error(w, "Invalid signature", http.StatusUnauthorized)
+				return
+			}
+			event = r.Header.Get("X-GitHub-Event")
+			message, notify, err = buildMessage(event, body)
 		}
-
-		event := r.Header.Get("X-GitHub-Event")
-		message, notify, err := buildMessage(event, body)
 		if err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
@@ -1151,7 +1360,7 @@ func main() {
 
 	log.Printf("listening on port %s", cfg.Port)
 	for _, route := range cfg.Routes {
-		log.Printf("GitHub webhook %s on %s for %d recipient(s)", route.Name, route.Path, len(route.Recipients))
+		log.Printf("webhook %s (%s) on %s for %d recipient(s)", route.Name, route.Kind, route.Path, len(route.Recipients))
 	}
 
 	server := &http.Server{

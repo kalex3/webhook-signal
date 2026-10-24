@@ -11,6 +11,17 @@
       "path": "/hooks/docs",
       "secretEnv": "DOCS_WEBHOOK_SECRET",
       "recipientsEnv": "DOCS_RECIPIENTS"
+    },
+    {
+      "name": "alerts",
+      "kind": "generic",
+      "path": "/hooks/alerts",
+      "secretEnv": "ALERTS_SECRET",
+      "recipients": ["+15551212000"],
+      "verify": "token",
+      "header": "Authorization",
+      "title": "Alert",
+      "fields": ["status", "check.url"]
     }
   ]
 }
