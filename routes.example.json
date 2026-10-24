@@ -1,0 +1,16 @@
+{
+  "routes": [
+    {
+      "name": "app",
+      "path": "/hooks/app",
+      "secretEnv": "APP_WEBHOOK_SECRET",
+      "recipients": ["+15551212000", "+15551212001"]
+    },
+    {
+      "name": "docs",
+      "path": "/hooks/docs",
+      "secretEnv": "DOCS_WEBHOOK_SECRET",
+      "recipientsEnv": "DOCS_RECIPIENTS"
+    }
+  ]
+}

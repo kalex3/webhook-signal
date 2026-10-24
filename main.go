@@ -13,19 +13,49 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const maxBodySize = 1 << 20 // 1 MiB
 
+// deliveryBudget stays under GitHub's 10s webhook timeout. Recipients are
+// notified in parallel so one slow send does not use the whole budget.
+const deliveryBudget = 9 * time.Second
+
 type Config struct {
-	Port          string
-	WebhookPath   string
-	WebhookSecret string
-	SignalAPI     string
-	Recipient     string
+	Port      string
+	SignalAPI string
+	Routes    []Route
+}
+
+// Route is one GitHub webhook endpoint and the Signal chats it notifies.
+type Route struct {
+	Name       string
+	Path       string
+	Secret     string
+	Recipients []string
+}
+
+type routeFile struct {
+	Routes []routeSpec `json:"routes"`
+}
+
+type routeSpec struct {
+	Name          string   `json:"name"`
+	Path          string   `json:"path"`
+	Secret        string   `json:"secret"`
+	SecretEnv     string   `json:"secretEnv"`
+	Recipients    []string `json:"recipients"`
+	RecipientsEnv string   `json:"recipientsEnv"`
+}
+
+type deliveryFailure struct {
+	recipient string
+	err       error
 }
 
 type repository struct {
@@ -193,38 +223,170 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func normalizePath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
+func normalizePath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
 		return "/webhook"
 	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
+	if !strings.HasPrefix(value, "/") {
+		value = "/" + value
 	}
-	if len(path) > 1 {
-		path = strings.TrimRight(path, "/")
-	}
-	return path
+	return path.Clean(value)
 }
 
-func loadConfig() Config {
+func splitRecipients(values ...string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if _, ok := seen[part]; ok {
+				continue
+			}
+			seen[part] = struct{}{}
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func checkPath(name, webhookPath string) error {
+	if webhookPath == "/health" {
+		return fmt.Errorf("route %s: path /health is reserved", name)
+	}
+	if webhookPath == "/" || !strings.HasPrefix(webhookPath, "/") || strings.ContainsAny(webhookPath, "{} \t") {
+		return fmt.Errorf("route %s: invalid path %q", name, webhookPath)
+	}
+	return nil
+}
+
+func loadConfig() (Config, error) {
+	port := env("PORT", "8080")
+	if _, err := strconv.Atoi(port); err != nil {
+		return Config{}, fmt.Errorf("PORT must be a valid port number")
+	}
+
 	cfg := Config{
-		Port:          env("PORT", "8080"),
-		WebhookPath:   normalizePath(env("WEBHOOK_PATH", "/webhook")),
-		WebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
-		SignalAPI:     strings.TrimRight(env("SIGNAL_API", "http://signal-cli:8080"), "/"),
-		Recipient:     os.Getenv("SIGNAL_RECIPIENT"),
+		Port:      port,
+		SignalAPI: strings.TrimRight(env("SIGNAL_API", "http://signal-cli:8080"), "/"),
 	}
 
-	if cfg.WebhookSecret == "" || cfg.Recipient == "" {
-		log.Fatal("Missing required environment variables: GITHUB_WEBHOOK_SECRET, SIGNAL_RECIPIENT")
+	var err error
+	if file := os.Getenv("ROUTES_FILE"); file != "" {
+		cfg.Routes, err = loadRoutesFile(file)
+	} else {
+		cfg.Routes, err = legacyRoute()
+	}
+	if err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func legacyRoute() ([]Route, error) {
+	secret := os.Getenv("GITHUB_WEBHOOK_SECRET")
+	recipients := splitRecipients(os.Getenv("SIGNAL_RECIPIENT"))
+	if secret == "" || len(recipients) == 0 {
+		return nil, fmt.Errorf("missing GITHUB_WEBHOOK_SECRET or SIGNAL_RECIPIENT (or set ROUTES_FILE)")
+	}
+	route := Route{
+		Name:       "github",
+		Path:       normalizePath(env("WEBHOOK_PATH", "/webhook")),
+		Secret:     secret,
+		Recipients: recipients,
+	}
+	if err := checkPath(route.Name, route.Path); err != nil {
+		return nil, err
+	}
+	return []Route{route}, nil
+}
+
+func loadRoutesFile(file string) ([]Route, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("read routes file: %w", err)
+	}
+	return parseRoutes(data)
+}
+
+func parseRoutes(data []byte) ([]Route, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var file routeFile
+	if err := dec.Decode(&file); err != nil {
+		return nil, fmt.Errorf("parse routes: %w", err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("parse routes: extra data after JSON")
+	}
+	if len(file.Routes) == 0 {
+		return nil, fmt.Errorf("routes file has no routes")
 	}
 
-	if _, err := strconv.Atoi(cfg.Port); err != nil {
-		log.Fatal("PORT must be a valid port number")
+	routes := make([]Route, 0, len(file.Routes))
+	seen := make(map[string]string)
+	for _, spec := range file.Routes {
+		route, err := resolveRoute(spec)
+		if err != nil {
+			return nil, err
+		}
+		if other, ok := seen[route.Path]; ok {
+			return nil, fmt.Errorf("routes %s and %s share path %s", other, route.Name, route.Path)
+		}
+		seen[route.Path] = route.Name
+		routes = append(routes, route)
+	}
+	return routes, nil
+}
+
+func resolveRoute(spec routeSpec) (Route, error) {
+	webhookPath := normalizePath(spec.Path)
+	name := strings.TrimSpace(spec.Name)
+	if name == "" {
+		name = webhookPath
+	}
+	if err := checkPath(name, webhookPath); err != nil {
+		return Route{}, err
 	}
 
-	return cfg
+	if spec.Secret != "" && spec.SecretEnv != "" {
+		return Route{}, fmt.Errorf("route %s: set secret or secretEnv, not both", name)
+	}
+	secret := spec.Secret
+	if spec.SecretEnv != "" {
+		secret = os.Getenv(spec.SecretEnv)
+		if secret == "" {
+			return Route{}, fmt.Errorf("route %s: environment variable %s is empty", name, spec.SecretEnv)
+		}
+	}
+	if secret == "" {
+		return Route{}, fmt.Errorf("route %s: missing secret", name)
+	}
+
+	recipients := splitRecipients(spec.Recipients...)
+	if spec.RecipientsEnv != "" {
+		value := os.Getenv(spec.RecipientsEnv)
+		if value == "" {
+			return Route{}, fmt.Errorf("route %s: environment variable %s is empty", name, spec.RecipientsEnv)
+		}
+		recipients = splitRecipients(append(spec.Recipients, value)...)
+	}
+	if len(recipients) == 0 {
+		recipients = splitRecipients(os.Getenv("SIGNAL_RECIPIENT"))
+	}
+	if len(recipients) == 0 {
+		return Route{}, fmt.Errorf("route %s: missing recipients", name)
+	}
+
+	return Route{
+		Name:       name,
+		Path:       webhookPath,
+		Secret:     secret,
+		Recipients: recipients,
+	}, nil
 }
 
 func verifySignature(secret string, body []byte, signature string) bool {
@@ -823,14 +985,14 @@ func buildMessage(event string, body []byte) (signalText, bool, error) {
 	}
 }
 
-func sendSignal(cfg Config, message signalText) error {
+func sendSignal(ctx context.Context, client *http.Client, api, recipient string, message signalText) error {
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return fmt.Errorf("generate request ID: %w", err)
 	}
 
 	params := map[string]any{
-		"recipient": []string{cfg.Recipient},
+		"recipient": []string{recipient},
 		"message":   message.body,
 	}
 	if len(message.styles) > 0 {
@@ -847,11 +1009,8 @@ func sendSignal(cfg Config, message signalText) error {
 		return fmt.Errorf("encode RPC request: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
 	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, cfg.SignalAPI+"/api/v1/rpc",
+		ctx, http.MethodPost, api+"/api/v1/rpc",
 		bytes.NewReader(requestBody),
 	)
 	if err != nil {
@@ -859,7 +1018,6 @@ func sendSignal(cfg Config, message signalText) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("Signal API request: %w", err)
@@ -887,7 +1045,37 @@ func sendSignal(cfg Config, message signalText) error {
 	return nil
 }
 
-func webhook(cfg Config) http.HandlerFunc {
+// deliver notifies each recipient on its own. GitHub retries the whole
+// delivery on a non-2xx response, so a later failure must not duplicate a
+// send that already succeeded.
+func deliver(api string, recipients []string, message signalText) (int, []deliveryFailure) {
+	ctx, cancel := context.WithTimeout(context.Background(), deliveryBudget)
+	defer cancel()
+	client := &http.Client{Timeout: deliveryBudget}
+
+	var mu sync.Mutex
+	sent := 0
+	var failures []deliveryFailure
+	var wg sync.WaitGroup
+	for _, recipient := range recipients {
+		wg.Add(1)
+		go func(recipient string) {
+			defer wg.Done()
+			err := sendSignal(ctx, client, api, recipient, message)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failures = append(failures, deliveryFailure{recipient: recipient, err: err})
+				return
+			}
+			sent++
+		}(recipient)
+	}
+	wg.Wait()
+	return sent, failures
+}
+
+func webhook(api string, route Route) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -905,7 +1093,7 @@ func webhook(cfg Config) http.HandlerFunc {
 			return
 		}
 
-		if !verifySignature(cfg.WebhookSecret, body, r.Header.Get("X-Hub-Signature-256")) {
+		if !verifySignature(route.Secret, body, r.Header.Get("X-Hub-Signature-256")) {
 			http.Error(w, "Invalid signature", http.StatusUnauthorized)
 			return
 		}
@@ -922,9 +1110,18 @@ func webhook(cfg Config) http.HandlerFunc {
 			return
 		}
 
-		if err := sendSignal(cfg, message); err != nil {
-			log.Printf("Signal delivery failed for %s: %v", event, err)
+		sent, failures := deliver(api, route.Recipients, message)
+		for _, failure := range failures {
+			log.Printf("Signal delivery failed for %s to %s: %v", event, failure.recipient, failure.err)
+		}
+		if sent == 0 {
 			http.Error(w, "Signal delivery failed", http.StatusBadGateway)
+			return
+		}
+		if len(failures) > 0 {
+			log.Printf("Signal notification partially sent for %s (%d/%d)", event, sent, len(route.Recipients))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("Notification partially sent"))
 			return
 		}
 
@@ -934,25 +1131,37 @@ func webhook(cfg Config) http.HandlerFunc {
 	}
 }
 
-func main() {
-	cfg := loadConfig()
-
+func newMux(cfg Config) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc(cfg.WebhookPath, webhook(cfg))
+	for _, route := range cfg.Routes {
+		mux.HandleFunc(route.Path, webhook(cfg.SignalAPI, route))
+	}
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	return mux
+}
+
+func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("listening on port %s", cfg.Port)
+	for _, route := range cfg.Routes {
+		log.Printf("GitHub webhook %s on %s for %d recipient(s)", route.Name, route.Path, len(route.Recipients))
+	}
 
 	server := &http.Server{
 		Addr:              "0.0.0.0:" + cfg.Port,
-		Handler:           mux,
+		Handler:           newMux(cfg),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      20 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("GitHub webhook receiver listening on port %s path %s", cfg.Port, cfg.WebhookPath)
 	log.Fatal(server.ListenAndServe())
 }

@@ -13,12 +13,18 @@ services:
   github-webhook:
     image: ghcr.io/kalex3/github-webhook-signal:latest
     restart: unless-stopped
+    # Several endpoints: copy routes.example.json to routes.json, uncomment
+    # the volume and ROUTES_FILE, and pass each secretEnv in environment.
+    # The file must be readable by uid 1000. SIGNAL_RECIPIENT may be a comma-separated list.
+    # volumes:
+    #   - ./routes.json:/routes.json:ro
     environment:
       - PORT=8080
       - WEBHOOK_PATH=/webhook
       - SIGNAL_API=http://signal-cli:8080
       - SIGNAL_RECIPIENT=${SIGNAL_RECIPIENT:?}
       - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:?}
+      # - ROUTES_FILE=/routes.json
     networks:
       - cloudflared
       - signal-cli
