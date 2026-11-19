@@ -29,6 +29,134 @@
       "path": "/hooks/monitoring",
       "secretEnv": "MONITORING_SECRET",
       "recipients": ["+15551212000"]
+    },
+    {
+      "name": "gitlab",
+      "kind": "map",
+      "path": "/hooks/gitlab",
+      "secretEnv": "GITLAB_TOKEN",
+      "verify": "token",
+      "header": "X-Gitlab-Token",
+      "match": [
+        {
+          "when": { "object_kind": "push" },
+          "title": "Push",
+          "subject": "project.path_with_namespace",
+          "fields": [
+            { "label": "Branch", "path": "ref", "trimPrefix": "refs/heads/" },
+            { "label": "By", "path": "user_name" }
+          ],
+          "each": { "path": "commits", "text": "id", "detail": "message", "short": 7, "limit": 5 },
+          "link": "project.web_url"
+        },
+        {
+          "when": { "object_kind": "pipeline" },
+          "title": "Pipeline",
+          "subject": "project.path_with_namespace",
+          "status": "object_attributes.status",
+          "ignore": ["pending", "running"]
+        }
+      ]
+    },
+    {
+      "name": "kuma",
+      "kind": "map",
+      "path": "/hooks/kuma",
+      "secretEnv": "KUMA_TOKEN",
+      "recipients": ["+15551212000"],
+      "verify": "token",
+      "match": [
+        {
+          "title": "Monitor",
+          "subject": "monitor.name",
+          "status": "heartbeat.status",
+          "statusMap": { "0": "down", "1": "up", "2": "pending", "3": "maintenance" },
+          "ignore": ["pending", "maintenance"],
+          "summary": "heartbeat.msg",
+          "link": "monitor.url"
+        }
+      ]
+    },
+    {
+      "name": "diun",
+      "kind": "map",
+      "path": "/hooks/diun",
+      "secretEnv": "DIUN_TOKEN",
+      "recipients": ["+15551212000"],
+      "verify": "token",
+      "match": [
+        {
+          "title": "Image",
+          "subject": "image",
+          "status": "status",
+          "ignore": ["unchange", "unchanged", "skip"],
+          "fields": [
+            { "label": "Host", "path": "hostname" },
+            { "label": "Platform", "path": "platform" }
+          ],
+          "link": "hub_link"
+        }
+      ]
+    },
+    {
+      "name": "forgejo",
+      "kind": "map",
+      "path": "/hooks/forgejo",
+      "secretEnv": "FORGEJO_WEBHOOK_SECRET",
+      "recipients": ["+15551212000"],
+      "verify": "hmac",
+      "header": "X-Hub-Signature-256",
+      "match": [
+        {
+          "present": ["commits"],
+          "title": "Push",
+          "subject": "repository.full_name",
+          "fields": [
+            { "label": "Branch", "path": "ref", "trimPrefix": "refs/heads/" },
+            { "label": "By", "path": "pusher.login" }
+          ],
+          "each": { "path": "commits", "text": "id", "detail": "message", "short": 7, "limit": 5 },
+          "link": "compare_url"
+        }
+      ]
+    },
+    {
+      "name": "woodpecker",
+      "kind": "map",
+      "path": "/hooks/woodpecker",
+      "secretEnv": "WOODPECKER_TOKEN",
+      "recipients": ["+15551212000"],
+      "verify": "token",
+      "match": [
+        {
+          "title": "Pipeline",
+          "subject": "repo",
+          "status": "status",
+          "ignore": ["pending", "running", "started"],
+          "summary": "message",
+          "fields": [
+            { "label": "Branch", "path": "branch" },
+            { "label": "By", "path": "author" }
+          ],
+          "link": "url"
+        }
+      ]
+    },
+    {
+      "name": "borgmatic",
+      "kind": "map",
+      "path": "/hooks/borgmatic",
+      "secretEnv": "BORGMATIC_TOKEN",
+      "recipients": ["+15551212000"],
+      "verify": "token",
+      "match": [
+        {
+          "title": "Backup",
+          "subject": "repository",
+          "status": "status",
+          "summary": "message"
+        }
+      ]
     }
   ]
 }

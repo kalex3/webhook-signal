@@ -15,6 +15,7 @@ services:
     restart: unless-stopped
     # Several endpoints: copy routes.example.json to routes.json, uncomment
     # the volume and ROUTES_FILE, and pass each secretEnv in environment.
+    # The example covers GitLab, Uptime Kuma, Diun, Forgejo, Woodpecker, and borgmatic.
     # The file must be readable by uid 1000. SIGNAL_RECIPIENT may be a comma-separated list.
     # volumes:
     #   - ./routes.json:/routes.json:ro

@@ -37,6 +37,7 @@ const (
 	kindGitHub  = "github"
 	kindGeneric = "generic"
 	kindAlert   = "alert"
+	kindMap     = "map"
 
 	verifyHMAC  = "hmac"
 	verifyToken = "token"
@@ -54,6 +55,7 @@ type Route struct {
 	Prefix     string
 	Title      string
 	Fields     []string
+	Match      []mapRule
 }
 
 type routeFile struct {
@@ -61,18 +63,75 @@ type routeFile struct {
 }
 
 type routeSpec struct {
-	Name          string   `json:"name"`
-	Kind          string   `json:"kind"`
-	Path          string   `json:"path"`
-	Secret        string   `json:"secret"`
-	SecretEnv     string   `json:"secretEnv"`
-	Recipients    []string `json:"recipients"`
-	RecipientsEnv string   `json:"recipientsEnv"`
-	Verify        string   `json:"verify"`
-	Header        string   `json:"header"`
-	Prefix        string   `json:"prefix"`
-	Title         string   `json:"title"`
-	Fields        []string `json:"fields"`
+	Name          string        `json:"name"`
+	Kind          string        `json:"kind"`
+	Path          string        `json:"path"`
+	Secret        string        `json:"secret"`
+	SecretEnv     string        `json:"secretEnv"`
+	Recipients    []string      `json:"recipients"`
+	RecipientsEnv string        `json:"recipientsEnv"`
+	Verify        string        `json:"verify"`
+	Header        string        `json:"header"`
+	Prefix        string        `json:"prefix"`
+	Title         string        `json:"title"`
+	Fields        []string      `json:"fields"`
+	Match         []mapRuleSpec `json:"match"`
+}
+
+type mapFieldSpec struct {
+	Label      string `json:"label"`
+	Path       string `json:"path"`
+	TrimPrefix string `json:"trimPrefix"`
+}
+
+type mapEachSpec struct {
+	Path   string `json:"path"`
+	Text   string `json:"text"`
+	Detail string `json:"detail"`
+	Limit  int    `json:"limit"`
+	Short  int    `json:"short"`
+}
+
+type mapRuleSpec struct {
+	When      map[string]string `json:"when"`
+	Present   []string          `json:"present"`
+	Ignore    []string          `json:"ignore"`
+	Status    string            `json:"status"`
+	StatusMap map[string]string `json:"statusMap"`
+	Title     string            `json:"title"`
+	Subject   string            `json:"subject"`
+	Summary   string            `json:"summary"`
+	Fields    []mapFieldSpec    `json:"fields"`
+	Each      *mapEachSpec      `json:"each"`
+	Link      string            `json:"link"`
+}
+
+type mapField struct {
+	Label      string
+	Path       string
+	TrimPrefix string
+}
+
+type mapEach struct {
+	Path   string
+	Text   string
+	Detail string
+	Limit  int
+	Short  int
+}
+
+type mapRule struct {
+	When      map[string]string
+	Present   []string
+	Ignore    []string
+	Status    string
+	StatusMap map[string]string
+	Title     string
+	Subject   string
+	Summary   string
+	Fields    []mapField
+	Each      *mapEach
+	Link      string
 }
 
 type deliveryFailure struct {
@@ -421,14 +480,24 @@ func resolveRoute(spec routeSpec) (Route, error) {
 		Recipients: recipients,
 		Fields:     fields,
 	}
+	if kind != kindMap && len(spec.Match) > 0 {
+		return Route{}, fmt.Errorf("route %s: kind %s does not use match", name, kind)
+	}
 	if kind == kindGitHub {
 		if spec.Verify != "" || spec.Header != "" || spec.Prefix != "" || spec.Title != "" || len(fields) > 0 {
 			return Route{}, fmt.Errorf("route %s: kind github does not use verify, header, prefix, title, or fields", name)
 		}
 		return route, nil
 	}
-	if kind == kindAlert && len(fields) > 0 {
-		return Route{}, fmt.Errorf("route %s: kind alert does not use fields", name)
+	if (kind == kindAlert || kind == kindMap) && len(fields) > 0 {
+		return Route{}, fmt.Errorf("route %s: kind %s does not use fields", name, kind)
+	}
+	if kind == kindMap {
+		rules, err := cleanMatch(name, spec.Match)
+		if err != nil {
+			return Route{}, err
+		}
+		route.Match = rules
 	}
 
 	verify := strings.ToLower(strings.TrimSpace(spec.Verify))
@@ -474,13 +543,170 @@ func routeKind(spec routeSpec) (string, error) {
 		return kindGitHub, nil
 	}
 	switch kind {
-	case kindGitHub, kindGeneric:
+	case kindGitHub, kindGeneric, kindMap:
 		return kind, nil
 	case kindAlert, "alertmanager", "grafana":
 		return kindAlert, nil
 	default:
 		return "", fmt.Errorf("unknown kind %q", spec.Kind)
 	}
+}
+
+func cleanMatch(routeName string, specs []mapRuleSpec) ([]mapRule, error) {
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("route %s: kind map requires match", routeName)
+	}
+	rules := make([]mapRule, 0, len(specs))
+	for i, spec := range specs {
+		rule, err := cleanMapRule(routeName, i, spec)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
+	}
+	return rules, nil
+}
+
+func cleanMapRule(routeName string, index int, spec mapRuleSpec) (mapRule, error) {
+	fail := func(format string, args ...any) (mapRule, error) {
+		return mapRule{}, fmt.Errorf("route %s: match %d: %s", routeName, index+1, fmt.Sprintf(format, args...))
+	}
+	when := make(map[string]string, len(spec.When))
+	for path, want := range spec.When {
+		if err := validPath(path); err != nil {
+			return fail("%s", err.Error())
+		}
+		want = strings.TrimSpace(want)
+		if want == "" {
+			return fail("empty when value for %s", path)
+		}
+		when[path] = want
+	}
+	var present []string
+	for _, path := range spec.Present {
+		path = strings.TrimSpace(path)
+		if err := validPath(path); err != nil {
+			return fail("%s", err.Error())
+		}
+		present = append(present, path)
+	}
+	var ignore []string
+	for _, value := range spec.Ignore {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return fail("empty ignore value")
+		}
+		ignore = append(ignore, value)
+	}
+	status := strings.TrimSpace(spec.Status)
+	if len(ignore) > 0 && status == "" {
+		return fail("ignore requires status")
+	}
+	if len(spec.StatusMap) > 0 && status == "" {
+		return fail("statusMap requires status")
+	}
+	statusMap := make(map[string]string, len(spec.StatusMap))
+	for key, value := range spec.StatusMap {
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" {
+			return fail("empty statusMap entry")
+		}
+		statusMap[key] = value
+	}
+	if len(statusMap) == 0 {
+		statusMap = nil
+	}
+	if err := optionalPath(status); err != nil {
+		return fail("%s", err.Error())
+	}
+	for _, path := range []string{spec.Subject, spec.Summary, spec.Link} {
+		if err := optionalPath(path); err != nil {
+			return fail("%s", err.Error())
+		}
+	}
+	fields := make([]mapField, 0, len(spec.Fields))
+	for _, field := range spec.Fields {
+		path := strings.TrimSpace(field.Path)
+		if err := validPath(path); err != nil {
+			return fail("%s", err.Error())
+		}
+		label := strings.TrimSpace(field.Label)
+		if label == "" {
+			label = path
+		}
+		fields = append(fields, mapField{Label: label, Path: path, TrimPrefix: field.TrimPrefix})
+	}
+	var each *mapEach
+	if spec.Each != nil {
+		if err := validPath(strings.TrimSpace(spec.Each.Path)); err != nil {
+			return fail("each %s", err.Error())
+		}
+		text := strings.TrimSpace(spec.Each.Text)
+		detail := strings.TrimSpace(spec.Each.Detail)
+		if text == "" && detail == "" {
+			return fail("each requires text or detail")
+		}
+		if text != "" {
+			if err := validPath(text); err != nil {
+				return fail("each %s", err.Error())
+			}
+		}
+		if detail != "" {
+			if err := validPath(detail); err != nil {
+				return fail("each %s", err.Error())
+			}
+		}
+		limit := spec.Each.Limit
+		if limit == 0 {
+			limit = 5
+		}
+		if limit < 1 || limit > 20 {
+			return fail("each limit must be from 1 to 20")
+		}
+		if spec.Each.Short < 0 || spec.Each.Short > 64 {
+			return fail("each short must be from 1 to 64")
+		}
+		each = &mapEach{
+			Path:   strings.TrimSpace(spec.Each.Path),
+			Text:   text,
+			Detail: detail,
+			Limit:  limit,
+			Short:  spec.Each.Short,
+		}
+	}
+	rule := mapRule{
+		When:      when,
+		Present:   present,
+		Ignore:    ignore,
+		Status:    status,
+		StatusMap: statusMap,
+		Title:     strings.TrimSpace(spec.Title),
+		Subject:   strings.TrimSpace(spec.Subject),
+		Summary:   strings.TrimSpace(spec.Summary),
+		Fields:    fields,
+		Each:      each,
+		Link:      strings.TrimSpace(spec.Link),
+	}
+	if rule.Title == "" && rule.Status == "" && rule.Subject == "" && rule.Summary == "" && len(rule.Fields) == 0 && rule.Each == nil && rule.Link == "" {
+		return fail("rule has nothing to send")
+	}
+	return rule, nil
+}
+
+func optionalPath(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	return validPath(path)
+}
+
+func validPath(path string) error {
+	if path == "" || strings.Contains(path, "..") || strings.HasPrefix(path, ".") || strings.HasSuffix(path, ".") || strings.ContainsAny(path, " \t{}") {
+		return fmt.Errorf("invalid path %q", path)
+	}
+	return nil
 }
 
 func cleanFields(fields []string) ([]string, error) {
@@ -1247,19 +1473,264 @@ func genericBody(body []byte) string {
 	return string(body)
 }
 
+func buildMapMessage(route Route, body []byte) (signalText, bool, error) {
+	var doc any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return signalText{}, false, err
+	}
+	root, ok := doc.(map[string]any)
+	if !ok {
+		return signalText{}, false, fmt.Errorf("expected JSON object")
+	}
+	for _, rule := range route.Match {
+		if !mapRuleMatches(root, rule) {
+			continue
+		}
+		if mapIgnored(root, rule) {
+			return signalText{}, false, nil
+		}
+		return renderMapRule(route, root, rule), true, nil
+	}
+	return signalText{}, false, nil
+}
+
+func mapRuleMatches(root map[string]any, rule mapRule) bool {
+	for path, want := range rule.When {
+		got, ok := lookupJSON(root, path)
+		if !ok || !strings.EqualFold(got, want) {
+			return false
+		}
+	}
+	for _, path := range rule.Present {
+		got, ok := lookupValue(root, path)
+		if !ok || !valuePresent(got) {
+			return false
+		}
+	}
+	return true
+}
+
+func valuePresent(v any) bool {
+	switch n := v.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(n) != ""
+	case []any:
+		return len(n) > 0
+	case map[string]any:
+		return len(n) > 0
+	default:
+		return true
+	}
+}
+
+func mapIgnored(root map[string]any, rule mapRule) bool {
+	if rule.Status == "" || len(rule.Ignore) == 0 {
+		return false
+	}
+	got, ok := ruleStatus(root, rule)
+	if !ok {
+		return false
+	}
+	for _, skip := range rule.Ignore {
+		if strings.EqualFold(got, skip) {
+			return true
+		}
+	}
+	return false
+}
+
+func ruleStatus(root map[string]any, rule mapRule) (string, bool) {
+	got, ok := lookupJSON(root, rule.Status)
+	if !ok {
+		return "", false
+	}
+	if mapped, ok := rule.StatusMap[strings.ToLower(got)]; ok {
+		return mapped, true
+	}
+	return got, true
+}
+
+func renderMapRule(route Route, root map[string]any, rule mapRule) signalText {
+	emoji := "🔔"
+	title := rule.Title
+	if title == "" {
+		title = route.Title
+	}
+	statusValue := ""
+	strike := false
+	if rule.Status != "" {
+		if got, ok := ruleStatus(root, rule); ok {
+			statusValue = got
+			var word string
+			emoji, word, strike = mapStatus(got)
+			if title == "" {
+				title = word
+			}
+		}
+	}
+	if title == "" {
+		title = "Notice"
+	}
+	subject := ""
+	if rule.Subject != "" {
+		subject, _ = lookupJSON(root, rule.Subject)
+	}
+
+	var w textBuilder
+	w.header(emoji, title, subject)
+	if statusValue != "" && (rule.Title != "" || route.Title != "") {
+		w.field("Status", statusValue)
+	}
+	if rule.Summary != "" {
+		if summary, ok := lookupJSON(root, rule.Summary); ok && summary != "" {
+			w.prose(truncate(firstLine(summary), 200), strike)
+			w.nl()
+		}
+	}
+	for _, field := range rule.Fields {
+		value, ok := lookupJSON(root, field.Path)
+		if !ok || value == "" {
+			continue
+		}
+		if field.TrimPrefix != "" {
+			value = strings.TrimPrefix(value, field.TrimPrefix)
+		}
+		w.field(field.Label, truncate(value, 200))
+	}
+	if rule.Each != nil {
+		renderMapEach(&w, root, rule.Each)
+	}
+	if rule.Link != "" {
+		if link, ok := lookupJSON(root, rule.Link); ok {
+			w.link(link)
+		}
+	}
+	return w.done()
+}
+
+func renderMapEach(w *textBuilder, root map[string]any, each *mapEach) {
+	raw, ok := lookupValue(root, each.Path)
+	if !ok {
+		return
+	}
+	items, ok := raw.([]any)
+	if !ok || len(items) == 0 {
+		return
+	}
+	shown := 0
+	extra := 0
+	for i, item := range items {
+		if shown == each.Limit {
+			extra = len(items) - i
+			break
+		}
+		elem, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		text := ""
+		if each.Text != "" {
+			text, _ = lookupJSON(elem, each.Text)
+			if each.Short > 0 {
+				text = truncate(text, each.Short)
+			}
+		}
+		detail := ""
+		if each.Detail != "" {
+			detail, _ = lookupJSON(elem, each.Detail)
+			detail = truncate(firstLine(detail), 150)
+		}
+		if text == "" && detail == "" {
+			continue
+		}
+		if shown == 0 {
+			w.nl()
+		}
+		shown++
+		w.write("• ")
+		if text != "" {
+			w.mono(text)
+		}
+		if detail != "" {
+			if text != "" {
+				w.write(" ")
+			}
+			w.italic(detail)
+		}
+		w.nl()
+	}
+	if extra > 0 {
+		w.italic(fmt.Sprintf("… and %d more", extra))
+		w.nl()
+	}
+}
+
+func mapStatus(status string) (emoji, word string, strike bool) {
+	switch strings.ToLower(status) {
+	case "success", "successful", "passed":
+		return "✅", "Success", false
+	case "failure", "failed", "error", "errored":
+		return "❌", "Failed", false
+	case "down":
+		return "❌", "Down", false
+	case "up":
+		return "✅", "Up", true
+	case "new":
+		return "🆕", "New", false
+	case "update", "updated":
+		return "⬆️", "Update", false
+	case "killed":
+		return "❌", "Killed", false
+	case "firing", "alerting":
+		return "🔥", "Firing", false
+	case "resolved", "ok":
+		return "✅", "Resolved", true
+	case "closed":
+		return "🚫", "Closed", true
+	case "merged":
+		return "🎉", "Merged", false
+	case "pending":
+		return "⏳", "Pending", false
+	case "running":
+		return "⚙️", "Running", false
+	case "cancelled", "canceled":
+		return "🚫", "Canceled", false
+	case "skipped":
+		return "⏭️", "Skipped", false
+	default:
+		if status == "" {
+			return "🔔", "Notice", false
+		}
+		return "🔔", prettyAction(status), false
+	}
+}
+
 func lookupJSON(v any, path string) (string, bool) {
+	found, ok := lookupValue(v, path)
+	if !ok {
+		return "", false
+	}
+	return formatJSON(found), true
+}
+
+func lookupValue(v any, path string) (any, bool) {
+	if path == "" {
+		return nil, false
+	}
 	cur := v
 	for _, part := range strings.Split(path, ".") {
 		obj, ok := cur.(map[string]any)
 		if !ok {
-			return "", false
+			return nil, false
 		}
 		cur, ok = obj[part]
 		if !ok || cur == nil {
-			return "", false
+			return nil, false
 		}
 	}
-	return formatJSON(cur), true
+	return cur, true
 }
 
 func formatJSON(v any) string {
@@ -1584,17 +2055,21 @@ func webhook(api string, route Route) http.HandlerFunc {
 			notify  bool
 			event   string
 		)
-		if route.Kind == kindGeneric || route.Kind == kindAlert {
+		if route.Kind == kindGeneric || route.Kind == kindAlert || route.Kind == kindMap {
 			if !verifyGeneric(route, r.Header.Get(route.Header), body) {
 				http.Error(w, "Invalid signature", http.StatusUnauthorized)
 				return
 			}
-			if route.Kind == kindAlert {
+			switch route.Kind {
+			case kindAlert:
 				message, err = buildAlertMessage(route, body)
-			} else {
+				notify = true
+			case kindMap:
+				message, notify, err = buildMapMessage(route, body)
+			default:
 				message, err = buildGenericMessage(route, body)
+				notify = true
 			}
-			notify = true
 			event = route.Name
 		} else {
 			if !verifySignature(route.Secret, body, r.Header.Get("X-Hub-Signature-256")) {
